@@ -1,176 +1,213 @@
 #!/bin/bash
 
-# ====================== 辅助函数 ======================
+# =====================================================
+#  Enterprise Swap Manager v2.0 (Anti-Failure Edition)
+# =====================================================
+
+SWAP_FILE="/swapfile"
+FSTAB="/etc/fstab"
+DEFAULT_SWAPPINESS=10
+
+# -------------------- 基础函数 --------------------
+
 format_size() {
-    local size_mb=$1
-    if [ "$size_mb" -ge 1024 ]; then
-        awk "BEGIN {printf \"%.1fG\", $size_mb/1024}"
+    local mb=$1
+    if [ "$mb" -ge 1024 ]; then
+        awk "BEGIN {printf \"%.1fG\", $mb/1024}"
     else
-        echo "${size_mb}MB"
+        echo "${mb}MB"
     fi
 }
 
-check_disk_space_mb() {
-    local required_mb=$1
-    local avail_kb=$(df / | awk 'NR==2 {print $4}')
-    local avail_mb=$((avail_kb / 1024))
-    if [ $avail_mb -lt $required_mb ]; then
-        echo "❌ 磁盘空间不足！至少需要 $(format_size $required_mb)，当前可用 $(format_size $avail_mb)"
-        return 1
+check_root() {
+    [ "$EUID" -ne 0 ] && {
+        echo "❌ 请使用 root 运行"
+        exit 1
+    }
+}
+
+detect_swap() {
+    echo "🔍 正在检测系统 Swap 状态..."
+    swapon --show
+    echo
+}
+
+has_swap() {
+    swapon --show | grep -q .
+}
+
+check_fstab() {
+    grep -q "$SWAP_FILE" "$FSTAB"
+}
+
+remove_swap() {
+    echo "🧹 清理 Swap..."
+
+    if swapon --show | grep -q "$SWAP_FILE"; then
+        swapoff "$SWAP_FILE"
     fi
-    echo "✅ 磁盘空间充足（可用 $(format_size $avail_mb)）"
-    return 0
+
+    rm -f "$SWAP_FILE"
+    sed -i "\|$SWAP_FILE|d" "$FSTAB"
+
+    echo "✅ Swap 已清理"
 }
 
-get_physical_memory_mb() {
-    grep MemTotal /proc/meminfo | awk '{print int($2/1024)}'
-}
-
-set_swappiness() {
-    local default=10
-    local current_val=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "$default")
-
-    echo -e "\n【Swappiness 设置】"
-    echo "📌 当前系统值: $current_val | 推荐: 10 (服务器最佳)"
-
-    read -p "👉 请输入 Swappiness (默认10): " swp_input
-    if [ -z "$swp_input" ]; then
-        swp_input=$default
-    fi
-
-    sed -i '/^vm.swappiness=/d' /etc/sysctl.conf
-    echo "vm.swappiness=$swp_input" >> /etc/sysctl.conf
-    sysctl -w vm.swappiness=$swp_input > /dev/null
-
-    echo "✅ Swappiness 已设置为: $swp_input"
-}
-
-remove_existing_swap() {
-    if [ -f /swapfile ]; then
-        echo "🔍 检测到现有 Swap 文件..."
-
-        if swapon --show | grep -q '/swapfile'; then
-            echo "📴 正在禁用 Swap..."
-            swapoff /swapfile
-        fi
-
-        rm -f /swapfile
-        sed -i '/\/swapfile/d' /etc/fstab
-
-        echo "✅ 已清理现有 Swap"
-    fi
-}
-
-create_swap_file() {
+create_swap() {
     local size_mb=$1
 
-    echo "⚙️  创建 $(format_size $size_mb) Swap..."
+    echo "⚙️ 创建 Swap: $(format_size $size_mb)"
 
-    # 优先 fallocate (快)
+    # 优先 fallocate
     if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l ${size_mb}M /swapfile
+        fallocate -l ${size_mb}M "$SWAP_FILE"
     else
-        dd if=/dev/zero of=/swapfile bs=1M count=$size_mb status=progress
+        dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$size_mb status=progress
     fi
 
-    chmod 600 /swapfile
-    mkswap /swapfile > /dev/null
-    swapon /swapfile
+    chmod 600 "$SWAP_FILE"
+    mkswap "$SWAP_FILE" >/dev/null 2>&1
+    swapon "$SWAP_FILE"
 
-    grep -q "/swapfile" /etc/fstab || \
-    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    # 防重复写入 fstab
+    if ! check_fstab; then
+        echo "$SWAP_FILE none swap sw 0 0" >> "$FSTAB"
+    fi
 
     echo "✅ Swap 创建完成"
 }
 
-# ====================== 自动策略 ======================
-calc_auto_swap() {
-    local mem_mb=$1
+set_swappiness() {
+    echo "⚙️ 设置 swappiness = $DEFAULT_SWAPPINESS"
 
-    if [ $mem_mb -le 512 ]; then
-        echo $((mem_mb * 2))
-    elif [ $mem_mb -le 1024 ]; then
+    sysctl vm.swappiness=$DEFAULT_SWAPPINESS >/dev/null 2>&1
+
+    sed -i '/vm.swappiness/d' /etc/sysctl.conf
+    echo "vm.swappiness=$DEFAULT_SWAPPINESS" >> /etc/sysctl.conf
+
+    echo "✅ swappiness 已设置"
+}
+
+calc_swap() {
+    local mem=$1
+
+    if [ $mem -le 512 ]; then
+        echo $((mem * 2))
+    elif [ $mem -le 1024 ]; then
         echo 1024
-    elif [ $mem_mb -le 2048 ]; then
-        echo 2048
-    elif [ $mem_mb -le 4096 ]; then
+    elif [ $mem -le 2048 ]; then
         echo 2048
     else
         echo 4096
     fi
 }
 
-# ====================== 自动配置 ======================
-auto_swap_setup() {
-
-    echo -e "\n【自动配置 Swap】"
-
-    local mem_mb=$(get_physical_memory_mb)
-    local auto_size=$(calc_auto_swap $mem_mb)
-
-    echo "💡 内存: $(format_size $mem_mb)"
-    echo "📌 推荐 Swap: $(format_size $auto_size)"
-
-    if ! check_disk_space_mb $auto_size; then return; fi
-
-    remove_existing_swap
-    create_swap_file $auto_size
-    set_swappiness
-
-    echo
-    free -h
-    echo
+get_mem() {
+    grep MemTotal /proc/meminfo | awk '{print int($2/1024)}'
 }
 
-# ====================== 手动配置 ======================
-manual_swap() {
+# -------------------- 核心逻辑 --------------------
 
-    local mem_mb=$(get_physical_memory_mb)
-    local recommend=$(calc_auto_swap $mem_mb)
+safe_create_swap() {
 
-    echo "💡 推荐 Swap: $(format_size $recommend)"
+    local mem=$(get_mem)
+    local recommend=$(calc_swap $mem)
 
-    read -p "请输入 Swap MB (回车默认): " size_mb
+    echo "======================================"
+    echo "💡 当前内存: $(format_size $mem)"
+    echo "📌 推荐 Swap: $(format_size $recommend)"
+    echo "======================================"
 
-    if [ -z "$size_mb" ]; then
-        size_mb=$recommend
+    detect_swap
+
+    if has_swap; then
+        echo "⚠️ 检测到已有 Swap！"
+
+        echo "请选择操作："
+        echo "1) 保留当前 Swap"
+        echo "2) 删除并重新创建"
+        echo "3) 退出"
+        read -p "👉 请输入: " op
+
+        case $op in
+            1)
+                echo "✔ 已保留现有 Swap"
+                exit 0
+                ;;
+            2)
+                remove_swap
+                ;;
+            3)
+                exit 0
+                ;;
+            *)
+                echo "❌ 无效选择"
+                exit 1
+                ;;
+        esac
     fi
 
-    check_disk_space_mb $size_mb || return
+    read -p "👉 是否创建 Swap $(format_size $recommend)? [Y/n]: " confirm
+    confirm=${confirm:-Y}
 
-    remove_existing_swap
-    create_swap_file $size_mb
+    if [[ "$confirm" != "Y" && "$confirm" != "y" ]]; then
+        echo "❌ 已取消"
+        exit 0
+    fi
+
+    create_swap $recommend
     set_swappiness
 
+    echo
+    echo "🎉 Swap 配置完成"
+    echo "======================================"
     free -h
+    echo "======================================"
 }
 
-remove_swap_only() {
-    remove_existing_swap
-    echo "✅ Swap 已删除"
+# -------------------- 删除模式 --------------------
+
+delete_swap() {
+    echo "⚠️ 即将删除 Swap"
+
+    detect_swap
+
+    read -p "确认删除？[y/N]: " c
+    if [[ "$c" == "y" || "$c" == "Y" ]]; then
+        remove_swap
+    else
+        echo "❌ 已取消"
+    fi
 }
 
-# ====================== 菜单 ======================
+# -------------------- 菜单 --------------------
+
+menu() {
+    clear
+    echo "======================================"
+    echo "   Enterprise Swap Manager v2.0"
+    echo "======================================"
+    echo "1) 自动安全创建 Swap"
+    echo "2) 删除 Swap"
+    echo "3) 查看 Swap 状态"
+    echo "4) 退出"
+    echo "======================================"
+    read -p "请选择: " c
+
+    case $c in
+        1) safe_create_swap ;;
+        2) delete_swap ;;
+        3) detect_swap ;;
+        4) exit 0 ;;
+        *) echo "❌ 无效"; sleep 1 ;;
+    esac
+}
+
+# -------------------- 启动 --------------------
+
+check_root
+
 while true; do
-clear
-echo "======================================="
-echo "        Swap 管理工具 (优化版)"
-echo "======================================="
-echo "1. 自动配置 Swap (推荐)"
-echo "2. 手动设置 Swap"
-echo "3. 删除 Swap"
-echo "4. 退出"
-echo "======================================="
-
-read -p "请选择: " choice
-
-case $choice in
-1) auto_swap_setup ;;
-2) manual_swap ;;
-3) remove_swap_only ;;
-4) exit ;;
-*) echo "无效"; sleep 1 ;;
-esac
-
-read -p "回车继续..."
+    menu
+    read -p "回车继续..."
 done
