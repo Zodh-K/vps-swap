@@ -21,4 +21,4 @@
 ## 📦 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库/main/swap.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Zodh-K/vps-swap/refs/heads/main/swap.sh)
